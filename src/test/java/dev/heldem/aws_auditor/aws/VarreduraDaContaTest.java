@@ -38,9 +38,11 @@ class VarreduraDaContaTest {
                 .thenReturn(GetCallerIdentityResponse.builder().account("123456789012").build());
 
         var global = mock(ColetorGlobal.class);
+        when(global.servico()).thenReturn("s3");
         when(global.coletar("123456789012")).thenReturn(List
                 .of(new BucketS3("arn:aws:s3:::aberto", "us-east-1", Map.of(), BloqueioDeAcessoPublico.nenhum())));
         var regional = mock(ColetorRegional.class);
+        when(regional.servico()).thenReturn("ec2");
         when(regional.coletar(any(), any())).thenAnswer(i -> List.of(new SecurityGroup(
                 "arn:aws:ec2:" + i.getArgument(1) + ":123456789012:security-group/sg-1", i.getArgument(1), Map.of(),
                 List.of(new RegraDeEntrada("tcp", 22, 22, "0.0.0.0/0")))));
@@ -49,7 +51,8 @@ class VarreduraDaContaTest {
         var motor = new MotorDeRegras(List.of(new BucketSemBloqueioPublicoRegra(relogio), new SecurityGroupAbertoRegra(relogio)));
         var propriedades = new AwsProperties(List.of("us-east-1", "sa-east-1"), "us-east-1", 3, null);
 
-        var resultado = new VarreduraDaConta(clientes, propriedades, List.of(global), List.of(regional), motor).executar();
+        var resultado = new VarreduraDaConta(clientes, propriedades, new VarreduraProperties(false, 16), List.of(global),
+                List.of(regional), motor, new io.micrometer.core.instrument.simple.SimpleMeterRegistry()).executar();
 
         verify(global, times(1)).coletar("123456789012");
         verify(regional).coletar("123456789012", "us-east-1");
