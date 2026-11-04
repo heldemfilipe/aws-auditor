@@ -56,6 +56,6 @@ class VarreduraDaContaTest {
         verify(regional).coletar("123456789012", "sa-east-1");
         assertThat(resultado.recursos()).hasSize(3); // 1 bucket + 1 security group por região
         assertThat(resultado.achados()).hasSize(3);
-        assertThat(resultado.achados().get(0).regra()).isEqualTo("SECURITY_GROUP_ABERTO"); // crítico primeiro
+        assertThat(resultado.achados().get(0).regra()).isEqualTo("SECURITY_GROUP_ABERTO:22"); // crítico primeiro
     }
 }
