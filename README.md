@@ -2,8 +2,8 @@
 
 > **Status:** projeto de estudo, em construção. Pronto: o projeto gerado, o BOM do SDK da AWS, o CI (Etapa 0), o motor de
 > regras testado, sem nenhuma linha do SDK (Etapa 1), a integração com o SDK v2 (Etapa 2) e a persistência dos achados no
-> DynamoDB com a comparação entre execuções (Etapa 3). **A varredura nunca rodou contra uma conta AWS real**: tudo foi testado
-> com respostas sintéticas, um servidor HTTP local e o DynamoDB Local.
+> DynamoDB com a comparação entre execuções (Etapa 3) e a varredura de várias regiões em paralelo, com métricas (Etapa 4). **A varredura nunca rodou contra uma conta
+> AWS real**: tudo foi testado com respostas sintéticas, um servidor HTTP local e o DynamoDB Local.
 > O que não existe está marcado como "a fazer".
 
 ## Problema
@@ -87,6 +87,47 @@ não um stub nosso (`RetryTest`). As credenciais do teste são valores de mentir
 O retry é a estratégia padrão do SDK (espera exponencial com jitter, só para erros que valem repetir). O número de
 tentativas é configurável. Medi uma vez: o tempo (697 ms) varia por causa do jitter.
 
+### Varredura paralela com threads virtuais (Etapa 4)
+
+Cada par (coletor, região) é uma tarefa independente: `VarreduraDaConta` as roda em sequência ou, com
+`auditor.varredura.paralela=true` (o padrão), em **threads virtuais** (`Executors.newVirtualThreadPerTaskExecutor()`), com um
+**teto de chamadas simultâneas** (`auditor.varredura.paralelismo-maximo`, padrão 16). O resultado é o mesmo (a ordem dos
+recursos segue a das tarefas, não a de quem terminou primeiro).
+
+**Como medi.** Sem conta AWS, um servidor HTTP local faz o papel do STS e do EC2, com **latência fixa de 150 ms por chamada de
+EC2** (a rede de verdade teria uma parecida, e variável). O cliente é o real do SDK v2. **12 regiões x 2 coletores (volumes
+e security groups) = 24 chamadas.** Uma rodada de aquecimento descartada e 3 medidas por configuração (`ParalelismoTest`):
+
+| Configuração | Tempos medidos (ms) | Observação |
+|---|---|---|
+| Sequencial | 3696, 3699, 3697 | 24 x 150 ms = 3.600 ms, mais o custo do SDK |
+| Paralela, teto 16 | 316, 313, 317 | ~12x mais rápida: 24 tarefas em 2 "ondas" de 16 |
+| Paralela, teto 4 | 935, 930, 938 | 6 ondas de 4: o ganho cai com o teto |
+
+O servidor registrou no máximo **16 chamadas simultâneas** com o teto 16: o semáforo funciona.
+
+**O que limitou o ganho:** o teto de chamadas simultâneas. Com 24 tarefas e teto 16, são duas ondas (16 + 8), então o tempo
+é ~2 x 150 ms, e não 1 x 150 ms. Os números seguem a conta quase exatamente (3.600 / 300 / 900 ms mais o custo fixo) porque
+a latência do servidor falso é fixa e ele atende tudo em paralelo. **Isto NÃO mede a AWS:** numa conta real o limite seria
+outro, o throttling das APIs (que o retry da Etapa 2 absorve, mas devolve tempo) e o pool de conexões HTTP do cliente, e a
+latência varia. O ganho de ~12x vale para este cenário; o número real depende da conta.
+
+**Falha em uma tarefa:** as demais terminam, cada falha vira o contador `auditor.varredura.erros{servico=...}` e a varredura
+inteira FALHA (`VarreduraFalhouException`, com todas as falhas na mensagem). Um resultado parcial não pode virar "conta
+limpa" nem resolver achados de recursos que simplesmente não foram lidos (teste: negar o `DescribeVolumes` em todas as regiões
+dá 12 erros do serviço `ec2` e uma exceção, sem resultado).
+
+**Métricas (Micrometer):**
+
+| Métrica | O que é |
+|---|---|
+| `auditor.varredura.duracao` (rótulo `paralela`) | tempo da varredura inteira, inclusive das que falham |
+| `auditor.achados` (rótulo `severidade`) | achados da última varredura, uma série por severidade (BAIXA a CRITICA, com zero) |
+| `auditor.varredura.erros` (rótulo `servico`: `ec2`, `s3`, `iam`, `sts`) | falhas por serviço |
+
+Testadas pelo `MeterRegistry` (`ParalelismoTest`); **não estão expostas por HTTP ainda**: o Actuator só publica a saúde, e
+expor `/actuator/metrics` sem proteção seria um erro, então isso fica para a Etapa 5, junto da chave de API.
+
 ### DynamoDB: achados e comparação entre execuções (Etapa 3)
 
 Todos contra o **DynamoDB Local** (`amazon/dynamodb-local`, via Testcontainers; sem conta AWS nem token), em
@@ -156,7 +197,7 @@ não uma que eu tenha visto funcionar numa role: pode faltar uma ação que só 
 - [x] Etapa 1: domínio e regras, sem AWS (quatro regras, 26 testes)
 - [x] Etapa 2: integração com o SDK v2 (coletores, policy mínima, retry medido; varredura real **não executada**)
 - [x] Etapa 3: DynamoDB e comparação entre execuções (escritas condicionais, três experimentos medidos no DynamoDB Local)
-- [ ] Etapa 4: paralelismo e métricas
+- [x] Etapa 4: paralelismo e métricas (12 regiões: 3,7 s em sequência, 0,31 s em paralelo contra um servidor com latência fixa)
 - [ ] Etapa 5: API e alertas
 - [ ] Etapa 6: container, agendamento e deploy
 
