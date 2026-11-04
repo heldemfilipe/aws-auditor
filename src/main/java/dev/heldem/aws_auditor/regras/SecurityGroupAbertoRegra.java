@@ -40,11 +40,15 @@ public class SecurityGroupAbertoRegra implements Regra {
         boolean ssh = grupo.entradas().stream().anyMatch(e -> e.abertaParaAInternet() && e.cobrePortaTcp(SSH));
         boolean rdp = grupo.entradas().stream().anyMatch(e -> e.abertaParaAInternet() && e.cobrePortaTcp(RDP));
         var agora = clock.instant();
+        // O código do achado leva a porta (SECURITY_GROUP_ABERTO:22): a identidade de um achado é (arn, regra), e SSH e RDP
+        // abertos no MESMO security group são dois problemas que se resolvem separadamente.
         if (ssh) {
-            achados.add(Achado.aberto(ID, Severidade.CRITICA, grupo.arn(), "SSH (porta 22) aberto para a internet.", agora));
+            achados.add(Achado.aberto(ID + ":" + SSH, Severidade.CRITICA, grupo.arn(),
+                    "SSH (porta 22) aberto para a internet.", agora));
         }
         if (rdp) {
-            achados.add(Achado.aberto(ID, Severidade.CRITICA, grupo.arn(), "RDP (porta 3389) aberto para a internet.", agora));
+            achados.add(Achado.aberto(ID + ":" + RDP, Severidade.CRITICA, grupo.arn(),
+                    "RDP (porta 3389) aberto para a internet.", agora));
         }
         return achados;
     }
