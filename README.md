@@ -2,8 +2,8 @@
 
 > **Status:** projeto de estudo, em construção. Pronto: o projeto gerado, o BOM do SDK da AWS, o CI (Etapa 0), o motor de
 > regras testado, sem nenhuma linha do SDK (Etapa 1), a integração com o SDK v2 (Etapa 2) e a persistência dos achados no
-> DynamoDB com a comparação entre execuções (Etapa 3) e a varredura de várias regiões em paralelo, com métricas (Etapa 4). **A varredura nunca rodou contra uma conta
-> AWS real**: tudo foi testado com respostas sintéticas, um servidor HTTP local e o DynamoDB Local.
+> DynamoDB com a comparação entre execuções (Etapa 3) a varredura de várias regiões em paralelo, com métricas (Etapa 4) e a API de achados com o aviso no Telegram (Etapa 5).
+> **A varredura nunca rodou contra uma conta AWS real**: tudo foi testado com respostas sintéticas, um servidor HTTP local e o DynamoDB Local.
 > O que não existe está marcado como "a fazer".
 
 ## Problema
@@ -87,6 +87,53 @@ não um stub nosso (`RetryTest`). As credenciais do teste são valores de mentir
 O retry é a estratégia padrão do SDK (espera exponencial com jitter, só para erros que valem repetir). O número de
 tentativas é configurável. Medi uma vez: o tempo (697 ms) varia por causa do jitter.
 
+### API de achados e aviso no Telegram (Etapa 5)
+
+**Autenticação.** Chave no cabeçalho `X-Api-Key`, lida da variável de ambiente `AUDITOR_API_KEY` e comparada em **tempo
+constante** (`MessageDigest.isEqual` sobre os SHA-256 das duas chaves; o hash primeiro, para o tamanho da chave verdadeira não
+vazar). Decisões:
+
+- **Falha fechada:** sem a variável definida, a API e as métricas recusam tudo (nenhuma chave "vazia" é aceita).
+- **401 antes de 404:** um caminho que não existe também pede a chave; sem ela não dá para descobrir rotas.
+- **Só `/actuator/health` é público**, para o orquestrador. `/actuator/metrics` (as métricas da Etapa 4) exige a chave.
+- **Por que chave e não JWT:** este projeto não tem provedor de identidade; é uma ferramenta de um operador, e uma chave
+  rotacionável por variável de ambiente basta. Com um Keycloak (como no room-booking-api), seria JWT.
+
+**Endpoints** (todos com `X-Api-Key`):
+
+| Método e caminho | O que faz |
+|---|---|
+| `GET /achados` | achados de um `status` (padrão `ABERTO`), do mais grave para o menos grave, paginados por `cursor` e `limite` (1 a 100); `severidadeMinima=ALTA` devolve ALTA e CRITICA e filtra **no próprio índice** |
+| `GET /achados/{id}` | um achado; o `id` é opaco (o par ARN + regra em base64 seguro para URL: o ARN tem `/` e `:`) |
+| `POST /achados/{id}/ignorar` | `{"justificativa": "...", "expiraEm": "2026-12-01T00:00:00Z"}` |
+
+**Ignorar** exige justificativa (até 500 caracteres) e uma validade no futuro e de **no máximo 365 dias**: ignorar sem validade
+vira esquecer para sempre. **Passada a data, o achado volta a ABERTO e a aparecer** (a reabertura é feita ao listar, ao buscar
+e a cada execução, de forma condicional: só se ainda está IGNORADO e vencido). Enquanto está ignorado, uma nova execução que
+o veja não muda o status. Ignorar um achado RESOLVIDO dá 409; um que não existe, 404. Entrada inválida dá 400 (limite fora da
+faixa, cursor que não decodifica, status inexistente, justificativa em branco, validade no passado ou longe demais).
+
+**Aviso no Telegram** (`NotificadorTelegram`): só achados **novos** (os que esta execução criou) de severidade **ALTA ou
+mais**, em **uma única mensagem por execução**, e não uma por achado (até 10 linhas, depois "... e mais N"). Sem achado novo
+grave, não manda nada. O texto é puro (sem `parse_mode`): descrições vêm da conta e não podem injetar formatação. O token e o
+chat vêm só de `TELEGRAM_BOT_TOKEN` e `TELEGRAM_CHAT_ID`; sem eles o aviso fica desligado. Falha do Telegram **não derruba a
+auditoria**: vira um log de aviso e o contador `auditor.notificacao.erros`.
+
+Testado com **WireMock** (nenhum bot de verdade; o token é um valor de mentira): dois achados novos graves geram **uma**
+requisição com os dois; um achado de severidade média não entra; sem novo grave, **zero** requisições; Telegram respondendo
+500 não propaga exceção.
+
+**Dois achados que só o teste mostrou:**
+
+1. **O `:` do token era codificado como `%3A`.** O token de um bot vai no caminho da URL (`/bot123456:ABC.../sendMessage`) e o
+   `RestClient`, ao expandir um template de URI, codificou o dois-pontos. Não sei se o Telegram aceitaria o `%3A`, então não
+   arrisquei: o URI é montado direto, com o `:` literal, e o formato do token é validado antes (`número:letras`), para só haver
+   caracteres seguros. Um token fora do formato desliga o aviso e é registrado **sem mostrar o valor**.
+2. **O token nunca pode aparecer em log.** Ele está na URL, e a mensagem de erro do cliente HTTP a incluiria. Só se loga o
+   tipo da exceção e o status HTTP (teste: com o Telegram em 500, o log traz "falhou (HTTP 500)" e não contém o token).
+
+**Não executado:** o aviso chegando de verdade em um chat do Telegram (precisa de um bot e de um token, que não existem aqui).
+
 ### Varredura paralela com threads virtuais (Etapa 4)
 
 Cada par (coletor, região) é uma tarefa independente: `VarreduraDaConta` as roda em sequência ou, com
@@ -125,8 +172,7 @@ dá 12 erros do serviço `ec2` e uma exceção, sem resultado).
 | `auditor.achados` (rótulo `severidade`) | achados da última varredura, uma série por severidade (BAIXA a CRITICA, com zero) |
 | `auditor.varredura.erros` (rótulo `servico`: `ec2`, `s3`, `iam`, `sts`) | falhas por serviço |
 
-Testadas pelo `MeterRegistry` (`ParalelismoTest`); **não estão expostas por HTTP ainda**: o Actuator só publica a saúde, e
-expor `/actuator/metrics` sem proteção seria um erro, então isso fica para a Etapa 5, junto da chave de API.
+Testadas pelo `MeterRegistry` (`ParalelismoTest`). Expostas em `/actuator/metrics`, **protegidas pela chave de API** (Etapa 5).
 
 ### DynamoDB: achados e comparação entre execuções (Etapa 3)
 
@@ -198,7 +244,7 @@ não uma que eu tenha visto funcionar numa role: pode faltar uma ação que só 
 - [x] Etapa 2: integração com o SDK v2 (coletores, policy mínima, retry medido; varredura real **não executada**)
 - [x] Etapa 3: DynamoDB e comparação entre execuções (escritas condicionais, três experimentos medidos no DynamoDB Local)
 - [x] Etapa 4: paralelismo e métricas (12 regiões: 3,7 s em sequência, 0,31 s em paralelo contra um servidor com latência fixa)
-- [ ] Etapa 5: API e alertas
+- [x] Etapa 5: API e alertas (consulta paginada pelo índice, ignorar com validade, chave em tempo constante, Telegram com WireMock; aviso real **não executado**)
 - [ ] Etapa 6: container, agendamento e deploy
 
 ## Licença
