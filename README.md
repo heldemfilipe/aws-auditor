@@ -1,8 +1,9 @@
 # aws-auditor
 
 > **Status:** projeto de estudo, em construção. Pronto: o projeto gerado, o BOM do SDK da AWS, o CI (Etapa 0), o motor de
-> regras testado, sem nenhuma linha do SDK (Etapa 1) e a integração com o SDK v2 (Etapa 2). **A varredura nunca rodou contra
-> uma conta AWS real**: tudo foi testado com respostas sintéticas e um servidor HTTP local.
+> regras testado, sem nenhuma linha do SDK (Etapa 1), a integração com o SDK v2 (Etapa 2) e a persistência dos achados no
+> DynamoDB com a comparação entre execuções (Etapa 3). **A varredura nunca rodou contra uma conta AWS real**: tudo foi testado
+> com respostas sintéticas, um servidor HTTP local e o DynamoDB Local.
 > O que não existe está marcado como "a fazer".
 
 ## Problema
@@ -27,8 +28,8 @@ aws/       a ÚNICA parte que importa o SDK: ClientesAws, um Coletor por serviç
 ```
 
 `VarreduraDaConta` descobre a conta (STS `GetCallerIdentity`, que não exige permissão IAM), coleta os serviços globais (S3 e
-IAM) uma vez e os regionais (EC2) em cada região, e entrega tudo ao motor. A persistência no DynamoDB (Etapa 3) e o job que
-sai com código 0 ou 1 (Etapa 6): a fazer.
+IAM) uma vez e os regionais (EC2) em cada região, e entrega tudo ao motor. A persistência dos achados (`persistencia/`,
+DynamoDB, Etapa 3) compara cada execução com a anterior. O job que sai com código 0 ou 1 (Etapa 6): a fazer.
 
 ## Como rodar
 
@@ -86,6 +87,43 @@ não um stub nosso (`RetryTest`). As credenciais do teste são valores de mentir
 O retry é a estratégia padrão do SDK (espera exponencial com jitter, só para erros que valem repetir). O número de
 tentativas é configurável. Medi uma vez: o tempo (697 ms) varia por causa do jitter.
 
+### DynamoDB: achados e comparação entre execuções (Etapa 3)
+
+Todos contra o **DynamoDB Local** (`amazon/dynamodb-local`, via Testcontainers; sem conta AWS nem token), em
+`RepositorioDeAchadosTest` (uma tabela nova por teste).
+
+| Experimento | Como montei | Observado |
+|---|---|---|
+| Repetição | registrar os mesmos 3 achados duas vezes | 1ª execução: 3 novos. 2ª: **0 novos**, 3 persistentes; **3 itens** na tabela (nenhum duplicado); a primeira vez visto não muda e o "visto por último" avança |
+| Correção | registrar 2 volumes e depois só 1 (o outro "foi removido") | o achado do volume removido vira **RESOLVIDO, com a data** e **continua na tabela**; rodar de novo não resolve outra vez nem muda a data |
+| Concorrência | **8 execuções simultâneas** (largada sincronizada) dos mesmos 25 achados | **25 itens** na tabela, **25 "novos" no total** (cada achado é novo para UMA só execução) e 175 persistentes (25 x 7) |
+| Resolução simultânea | 6 execuções resolvendo o mesmo achado ao mesmo tempo | resolvido **uma só vez** no total |
+
+**Tabela.** Partição = ARN do recurso, ordenação = código da regra (a identidade do achado é o par). O índice secundário
+`status-severidade` (partição = status, ordenação = nível da severidade, um número de 0 a 3) responde "achados ABERTOS e
+graves" com uma consulta (`status = ABERTO` e `severidadeNivel >= ALTA`), sem varrer a tabela. Cobrança por requisição.
+Limite do índice: o status tem pouquíssimos valores, então a partição `ABERTO` concentra a leitura; para o volume de
+achados de uma conta isso não importa, e eu **não medi** o que aconteceria com milhões de itens.
+
+**Escritas condicionais (`ConditionExpression`).** É o que impede a duplicação e a corrida:
+
+- **novo:** `PutItem` com `attribute_not_exists(arn)`: dos concorrentes, só um cria;
+- **persistente:** atualiza o "visto por último" só se está ABERTO e a data é mais nova;
+- **resolvido:** ABERTO vira RESOLVIDO só se ninguém o viu depois deste instante. Teste: uma execução atrasada (de T2) que
+  não viu o achado **não** resolve o que uma execução mais nova (T3) acabou de ver;
+- **reaberto:** RESOLVIDO volta a ABERTO (com `reabertoEm`, mantendo a primeira vez visto) só se ainda está RESOLVIDO.
+
+**IGNORADO** (a decisão humana da Etapa 5) nunca é desfeito pela varredura: continua IGNORADO mesmo que o achado reapareça ou
+suma. **A identidade é (ARN, regra)**: SSH e RDP abertos no mesmo security group são dois achados (`SECURITY_GROUP_ABERTO:22`
+e `:3389`) que se resolvem separadamente; nasceu de um erro de modelagem que eu só percebi ao desenhar a chave da tabela.
+
+**Tempos em milissegundos (número), não em texto ISO:** o DynamoDB compara texto letra a letra e o ISO muda de tamanho
+conforme a fração de segundo, então as condições "mais novo que" ordenariam errado.
+
+**Limites:** o diff lê a tabela inteira (`scan`) no início de cada execução, o que serve para este tamanho e não escala
+para milhões de achados; a tabela é criada por `criarTabelaSeNaoExistir()` no local, e em produção seria o Terraform
+(Etapa 6, não executada). Não rodei contra o DynamoDB real: o comportamento de condição e de índice é o do DynamoDB Local.
+
 ## Integração com a AWS (Etapa 2)
 
 - **Credenciais:** só a cadeia padrão do SDK (variáveis de ambiente, perfil, role da tarefa), resolvida de forma preguiçosa:
@@ -117,7 +155,7 @@ não uma que eu tenha visto funcionar numa role: pode faltar uma ação que só 
 - [x] Etapa 0: repositório, projeto gerado, BOM do SDK e CI
 - [x] Etapa 1: domínio e regras, sem AWS (quatro regras, 26 testes)
 - [x] Etapa 2: integração com o SDK v2 (coletores, policy mínima, retry medido; varredura real **não executada**)
-- [ ] Etapa 3: DynamoDB e comparação entre execuções
+- [x] Etapa 3: DynamoDB e comparação entre execuções (escritas condicionais, três experimentos medidos no DynamoDB Local)
 - [ ] Etapa 4: paralelismo e métricas
 - [ ] Etapa 5: API e alertas
 - [ ] Etapa 6: container, agendamento e deploy
