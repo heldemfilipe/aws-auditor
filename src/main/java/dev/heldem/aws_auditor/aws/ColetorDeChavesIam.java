@@ -29,6 +29,11 @@ public class ColetorDeChavesIam implements ColetorGlobal {
     }
 
     @Override
+    public String servico() {
+        return "iam";
+    }
+
+    @Override
     public List<String> acoesIam() {
         return List.of("iam:ListUsers", "iam:ListAccessKeys", "iam:GetAccessKeyLastUsed");
     }

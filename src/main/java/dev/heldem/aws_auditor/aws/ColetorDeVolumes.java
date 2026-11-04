@@ -29,6 +29,11 @@ public class ColetorDeVolumes implements ColetorRegional {
     }
 
     @Override
+    public String servico() {
+        return "ec2";
+    }
+
+    @Override
     public List<String> acoesIam() {
         return List.of("ec2:DescribeVolumes");
     }

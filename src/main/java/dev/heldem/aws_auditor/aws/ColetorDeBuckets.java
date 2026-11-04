@@ -28,6 +28,11 @@ public class ColetorDeBuckets implements ColetorGlobal {
     }
 
     @Override
+    public String servico() {
+        return "s3";
+    }
+
+    @Override
     public List<String> acoesIam() {
         return List.of("s3:ListAllMyBuckets", "s3:GetBucketPublicAccessBlock");
     }

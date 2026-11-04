@@ -8,7 +8,7 @@ import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
 
 @Configuration
-@EnableConfigurationProperties(AwsProperties.class)
+@EnableConfigurationProperties({ AwsProperties.class, VarreduraProperties.class })
 class AwsConfig {
 
     /**

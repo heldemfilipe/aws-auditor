@@ -8,6 +8,9 @@ import java.util.List;
  */
 public interface Coletor {
 
+    /** O serviço da AWS que este coletor lê ("ec2", "s3", "iam"): é o rótulo da métrica de erros por serviço. */
+    String servico();
+
     /** As ações IAM chamadas por este coletor (ex.: "ec2:DescribeVolumes"). */
     List<String> acoesIam();
 }
