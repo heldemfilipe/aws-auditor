@@ -37,6 +37,8 @@ public class AchadoItem {
     private long ultimaVezVisto;
     private Long resolvidoEm;
     private Long reabertoEm;
+    private Long ignoradoAte;
+    private String justificativa;
 
     @DynamoDbPartitionKey
     public String getArn() {
@@ -113,6 +115,24 @@ public class AchadoItem {
 
     public void setResolvidoEm(Long resolvidoEm) {
         this.resolvidoEm = resolvidoEm;
+    }
+
+    /** Até quando o achado fica ignorado (ms desde 1970); passada a data, ele volta a ABERTO. */
+    public Long getIgnoradoAte() {
+        return ignoradoAte;
+    }
+
+    public void setIgnoradoAte(Long ignoradoAte) {
+        this.ignoradoAte = ignoradoAte;
+    }
+
+    /** Por que um humano mandou ignorar. */
+    public String getJustificativa() {
+        return justificativa;
+    }
+
+    public void setJustificativa(String justificativa) {
+        this.justificativa = justificativa;
     }
 
     public Long getReabertoEm() {

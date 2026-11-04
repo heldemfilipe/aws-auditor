@@ -92,6 +92,13 @@
 			<artifactId>spring-boot-starter-webmvc-test</artifactId>
 			<scope>test</scope>
 		</dependency>
+		<!-- WireMock: o Telegram (e a chamada HTTP de saída) nos testes, sem token de bot de verdade -->
+		<dependency>
+			<groupId>org.wiremock</groupId>
+			<artifactId>wiremock-standalone</artifactId>
+			<version>3.13.2</version>
+			<scope>test</scope>
+		</dependency>
 		<!-- DynamoDB Local (amazon/dynamodb-local) nos testes, sem conta AWS nem token -->
 		<dependency>
 			<groupId>org.testcontainers</groupId>

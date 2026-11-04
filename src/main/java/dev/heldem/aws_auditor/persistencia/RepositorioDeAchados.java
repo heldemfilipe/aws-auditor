@@ -1,7 +1,11 @@
 package dev.heldem.aws_auditor.persistencia;
 
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Collection;
+import java.nio.charset.StandardCharsets;
+import java.util.Optional;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -19,7 +23,9 @@ import software.amazon.awssdk.enhanced.dynamodb.Expression;
 import software.amazon.awssdk.enhanced.dynamodb.Key;
 import software.amazon.awssdk.enhanced.dynamodb.model.EnhancedGlobalSecondaryIndex;
 import software.amazon.awssdk.enhanced.dynamodb.model.PutItemEnhancedRequest;
+import software.amazon.awssdk.enhanced.dynamodb.model.Page;
 import software.amazon.awssdk.enhanced.dynamodb.model.QueryConditional;
+import software.amazon.awssdk.enhanced.dynamodb.model.QueryEnhancedRequest;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.dynamodb.model.AttributeValue;
 import software.amazon.awssdk.services.dynamodb.model.BillingMode;
@@ -92,6 +98,13 @@ public class RepositorioDeAchados {
      * testes controlarem o tempo).
      */
     public ResultadoDoDiff registrar(Collection<Achado> encontrados, Instant agora) {
+        return registrarComDetalhes(encontrados, agora).diff();
+    }
+
+    /** O diff e os achados que foram criados AGORA (para avisar só dos novos). */
+    public Registro registrarComDetalhes(Collection<Achado> encontrados, Instant agora) {
+        reabrirIgnoradosExpirados(agora);
+        var novosAchados = new ArrayList<Achado>();
         long ms = agora.toEpochMilli();
         Map<String, AchadoItem> existentes = new HashMap<>();
         todos().forEach(i -> existentes.put(chave(i.getArn(), i.getRegra()), i));
@@ -107,6 +120,7 @@ public class RepositorioDeAchados {
             if (existente == null) {
                 if (criar(achado, ms)) {
                     novos++;
+                    novosAchados.add(achado);
                 } else {
                     persistentes++; // outra execução o criou no meio tempo
                 }
@@ -130,7 +144,111 @@ public class RepositorioDeAchados {
                 resolvidos++;
             }
         }
-        return new ResultadoDoDiff(novos, persistentes, resolvidos, reabertos, ignorados);
+        return new Registro(new ResultadoDoDiff(novos, persistentes, resolvidos, reabertos, ignorados),
+                List.copyOf(novosAchados));
+    }
+
+    /** @param novosAchados os achados que esta execução criou (nunca vistos antes) */
+    public record Registro(ResultadoDoDiff diff, List<Achado> novosAchados) {
+    }
+
+    /** Uma página de achados e o cursor opaco da próxima ({@code null} na última). */
+    public record PaginaDeItens(List<AchadoItem> itens, String proximoCursor) {
+    }
+
+    public enum ResultadoDoIgnorar {
+        IGNORADO, NAO_ENCONTRADO, NAO_APLICAVEL
+    }
+
+    public Optional<AchadoItem> buscar(String arn, String regra) {
+        return Optional.ofNullable(tabela.getItem(Key.builder().partitionValue(arn).sortValue(regra).build()));
+    }
+
+    /**
+     * Ignora um achado ABERTO (ou prorroga um já ignorado) até a data. Um achado RESOLVIDO não tem o que ignorar.
+     * Condicional: se alguém o resolveu no meio tempo, não o transforma em IGNORADO.
+     */
+    public ResultadoDoIgnorar ignorar(String arn, String regra, String justificativa, Instant ate) {
+        boolean ok = atualizar(arn, regra, "SET #s = :ignorado, ignoradoAte = :ate, justificativa = :justificativa",
+                "#s IN (:aberto, :ignorado)",
+                Map.of(":ignorado", s(StatusAchado.IGNORADO.name()), ":aberto", s(StatusAchado.ABERTO.name()),
+                        ":ate", n(ate.toEpochMilli()), ":justificativa", s(justificativa)));
+        if (ok) {
+            return ResultadoDoIgnorar.IGNORADO;
+        }
+        return buscar(arn, regra).isPresent() ? ResultadoDoIgnorar.NAO_APLICAVEL : ResultadoDoIgnorar.NAO_ENCONTRADO;
+    }
+
+    /** Achados ignorados cuja data passou voltam a ABERTO (e a aparecer). Condicional: só se ainda IGNORADO e vencido. */
+    public int reabrirIgnoradosExpirados(Instant agora) {
+        long ms = agora.toEpochMilli();
+        int reabertos = 0;
+        for (AchadoItem item : porStatusItens(StatusAchado.IGNORADO)) {
+            if (item.getIgnoradoAte() != null && item.getIgnoradoAte() < ms
+                    && atualizar(item.getArn(), item.getRegra(),
+                            "SET #s = :aberto, reabertoEm = :agora REMOVE ignoradoAte, justificativa",
+                            "#s = :ignorado AND ignoradoAte < :agora",
+                            Map.of(":aberto", s(StatusAchado.ABERTO.name()), ":ignorado", s(StatusAchado.IGNORADO.name()),
+                                    ":agora", n(ms)))) {
+                reabertos++;
+            }
+        }
+        return reabertos;
+    }
+
+    private List<AchadoItem> porStatusItens(StatusAchado status) {
+        return tabela.index(AchadoItem.INDICE_STATUS_SEVERIDADE)
+                .query(r -> r.queryConditional(QueryConditional.keyEqualTo(Key.builder().partitionValue(status.name()).build())))
+                .stream().flatMap(pagina -> pagina.items().stream()).toList();
+    }
+
+    /**
+     * Uma página de achados de um status, do mais grave para o menos grave, pelo índice secundário (status + severidade).
+     * O cursor é a chave onde a página anterior parou.
+     *
+     * @param minima só achados com esta severidade ou mais grave ({@code null} = todas)
+     * @throws IllegalArgumentException se o cursor for inválido
+     */
+    public PaginaDeItens listar(StatusAchado status, Severidade minima, int limite, String cursor) {
+        QueryConditional condicao = minima == null
+                ? QueryConditional.keyEqualTo(Key.builder().partitionValue(status.name()).build())
+                : QueryConditional.sortGreaterThanOrEqualTo(
+                        Key.builder().partitionValue(status.name()).sortValue(minima.ordinal()).build());
+        var pedido = QueryEnhancedRequest.builder().queryConditional(condicao).scanIndexForward(false).limit(limite);
+        if (cursor != null && !cursor.isBlank()) {
+            pedido.exclusiveStartKey(decodificar(cursor));
+        }
+        Page<AchadoItem> pagina;
+        try {
+            pagina = tabela.index(AchadoItem.INDICE_STATUS_SEVERIDADE).query(pedido.build()).iterator().next();
+        } catch (software.amazon.awssdk.services.dynamodb.model.DynamoDbException e) {
+            if (cursor != null && !cursor.isBlank()) {
+                throw new IllegalArgumentException("cursor inválido", e); // uma chave que não é desta consulta
+            }
+            throw e;
+        }
+        String proximo = pagina.lastEvaluatedKey() == null ? null : codificar(pagina.lastEvaluatedKey());
+        return new PaginaDeItens(pagina.items(), proximo);
+    }
+
+    private static String codificar(Map<String, AttributeValue> chave) {
+        String texto = String.join("\u0000", chave.get("arn").s(), chave.get("regra").s(), chave.get("status").s(),
+                chave.get("severidadeNivel").n());
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(texto.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static Map<String, AttributeValue> decodificar(String cursor) {
+        try {
+            String[] partes = new String(Base64.getUrlDecoder().decode(cursor), StandardCharsets.UTF_8).split("\u0000", -1);
+            if (partes.length != 4) {
+                throw new IllegalArgumentException("cursor inválido");
+            }
+            Integer.parseInt(partes[3]);
+            return Map.of("arn", s(partes[0]), "regra", s(partes[1]), "status", s(partes[2]),
+                    "severidadeNivel", AttributeValue.builder().n(partes[3]).build());
+        } catch (IllegalArgumentException e) { // Base64 e número inválidos também são IllegalArgumentException
+            throw new IllegalArgumentException("cursor inválido", e);
+        }
     }
 
     private boolean criar(Achado achado, long ms) {
