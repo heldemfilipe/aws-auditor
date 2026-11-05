@@ -2,8 +2,8 @@
 
 > **Status:** projeto de estudo, em construção. Pronto: o projeto gerado, o BOM do SDK da AWS, o CI (Etapa 0), o motor de
 > regras testado, sem nenhuma linha do SDK (Etapa 1), a integração com o SDK v2 (Etapa 2) e a persistência dos achados no
-> DynamoDB com a comparação entre execuções (Etapa 3) a varredura de várias regiões em paralelo, com métricas (Etapa 4) e a API de achados com o aviso no Telegram (Etapa 5).
-> **A varredura nunca rodou contra uma conta AWS real**: tudo foi testado com respostas sintéticas, um servidor HTTP local e o DynamoDB Local.
+> DynamoDB com a comparação entre execuções (Etapa 3) a varredura de várias regiões em paralelo, com métricas (Etapa 4) a API de achados com o aviso no Telegram (Etapa 5) e a entrega: imagem, modo job e Terraform (Etapa 6).
+> **A varredura nunca rodou contra uma conta AWS real, e o Terraform nunca foi aplicado**: tudo foi testado com respostas sintéticas, um servidor HTTP local e o DynamoDB Local.
 > O que não existe está marcado como "a fazer".
 
 ## Problema
@@ -34,7 +34,8 @@ DynamoDB, Etapa 3) compara cada execução com a anterior. O job que sai com có
 ## Como rodar
 
 ```bash
-./mvnw verify
+./mvnw verify                      # testes (o DynamoDB Local sobe sozinho pelo Docker)
+docker build -t aws-auditor:local . # imagem; em modo job, veja a Etapa 6
 ```
 
 ## Regras
@@ -86,6 +87,70 @@ não um stub nosso (`RetryTest`). As credenciais do teste são valores de mentir
 
 O retry é a estratégia padrão do SDK (espera exponencial com jitter, só para erros que valem repetir). O número de
 tentativas é configurável. Medi uma vez: o tempo (697 ms) varia por causa do jitter.
+
+### Entrega: imagem, modo job e Terraform (Etapa 6)
+
+**Imagem (`Dockerfile`).** Duas etapas: o JDK 25 compila (dependências numa camada própria) e só o JRE 25 mais o jar vão para a
+imagem final, que roda como **usuário 10001** (não root; conferido com `docker image inspect`). 571 MB; não tentei reduzir. Nada
+de segredo na imagem: token do Telegram e chave da API chegam por variável de ambiente.
+
+**Modo job.** Com `AUDITOR_JOB_HABILITADO=true` (e `SPRING_MAIN_WEB_APPLICATION_TYPE=none`, sem servidor web) a aplicação roda
+**uma** auditoria e encerra com código de saída **0** (a auditoria rodou e foi registrada, mesmo achando problemas: achar
+problema é o trabalho) ou **1** (falhou: sem credenciais, sem permissão, DynamoDB fora, coletor com erro). Sem a variável, sobe
+como API normal. Rodei a imagem em modo job **sem credenciais**: ela subiu em 1,9 s, falhou com "Unable to load credentials" e
+**saiu com código 1** (só esse caminho foi exercitado na imagem; o código 0 está coberto por teste unitário, `ModoJobTest`,
+com a auditoria simulada, não por uma execução de ponta a ponta).
+
+```bash
+docker build -t aws-auditor:local .
+docker run --rm -e AUDITOR_JOB_HABILITADO=true -e SPRING_MAIN_WEB_APPLICATION_TYPE=none aws-auditor:local; echo $?
+```
+
+**Trivy.** Imagem escaneada localmente (`aquasec/trivy:0.76.1`, `--severity HIGH,CRITICAL --ignore-unfixed`): **0
+vulnerabilidades** no Ubuntu 24.04 da base e **0** no jar. Limites: só vulnerabilidades, e `--ignore-unfixed` esconde as sem
+correção; é o retrato de hoje.
+
+**CI.** `ci.yml`: o job `build` (testes, com Docker para o DynamoDB Local) e o job `imagem` (constrói a imagem e roda o Trivy;
+HIGH/CRITICAL com correção derrubam). `publicar.yml` roda **só ao criar uma tag `v*`**: constrói, escaneia e, **só se passar**,
+publica `ghcr.io/<dono>/aws-auditor` com o `GITHUB_TOKEN` do próprio job. Sem cron e sem segredo cadastrado à mão. Os workflows
+foram validados com o `actionlint`; o job `imagem` roda sozinho no próximo push, e o `publicar.yml` **nunca rodou** (publicação
+no GHCR: **não executada**).
+
+**Terraform (`infra/`)** (**escrito e validado offline, nunca aplicado**):
+
+| Recurso | O que é |
+|---|---|
+| `aws_dynamodb_table` | a tabela de achados com o mesmo desenho do código (partição `arn`, ordenação `regra`, índice `status-severidade`), cobrança por requisição, recuperação pontual ligada |
+| `aws_iam_role` da **task** | a policy mínima da Etapa 2 (`docs/iam`, lida por `file()`) + escrita SÓ na própria tabela e no índice, com exatamente as ações que o repositório usa (sem `DeleteItem`, sem criar tabela) |
+| `aws_iam_role` de **execução** | `AmazonECSTaskExecutionRolePolicy` + `ssm:GetParameters` só nos três parâmetros |
+| `aws_ssm_parameter` (3, SecureString) | token do Telegram, chat e chave da API, com valor de mentira e `ignore_changes`: o valor de verdade se grava FORA do Terraform e não vai para o state |
+| ECS Fargate (cluster, task, log group) | a task em modo job, com os segredos injetados por referência ao SSM |
+| `aws_security_group` | sem entrada; saída só em 443 |
+| `aws_scheduler_schedule` + papel do agendador | o agendamento diário; o papel só pode iniciar ESTA task e passar ESTES dois papéis |
+
+O agendamento **nasce desligado** (`agendamento_ativo = false`): só se liga depois de conferir o custo e de preencher o SSM.
+`terraform destroy` removeria tudo (sem proteção contra exclusão na tabela, de propósito, como o roteiro pede).
+
+Validação feita: `terraform fmt -check` e `terraform validate` ("The configuration is valid", provedor AWS 6.x). **Isso só
+prova que a configuração é válida, não que funciona**: nunca houve `plan` nem `apply`, então nada garante que, por exemplo, a
+task consiga mesmo puxar a imagem ou chegar à AWS na rede escolhida.
+
+**Achados do Trivy no Terraform (`trivy config`), todos assumidos e não escondidos:**
+
+| Achado | Gravidade | Por que não corrigi |
+|---|---|---|
+| AWS-0104: saída irrestrita (`0.0.0.0/0`) no security group | CRITICAL (segundo o Trivy) | é a saída do job para as APIs da AWS e o Telegram, cujos IPs não são fixos; já está limitada à porta 443 e **sem nenhuma entrada** |
+| AWS-0025: tabela sem chave KMS gerenciada pelo cliente | LOW | a chave própria custa por mês; a criptografia padrão (chave da AWS) fica ligada |
+| AWS-0017: log group sem KMS | LOW | idem |
+| AWS-0034: cluster sem container insights | LOW | tem custo; para um job diário não compensa |
+
+**Custo: não calculei.** Não rodei na AWS, então não sei quanto tempo uma execução leva numa conta real, que é a variável que
+decide a conta do Fargate (cobrado pelo tempo de vCPU e memória da task) e do DynamoDB (por requisição). Antes de ligar o
+agendamento, confira na calculadora da AWS com a duração medida de uma execução. **Não fiz** a imagem nativa com GraalVM
+(opcional do roteiro). **Não reaproveitei** módulos do Terraform 1: o `infra/` é um módulo único e simples.
+
+**Não executado (o "pronto quando" do roteiro):** uma execução agendada que rodou sozinha, o aviso chegando no Telegram e o
+`terraform destroy` removendo tudo.
 
 ### API de achados e aviso no Telegram (Etapa 5)
 
@@ -235,7 +300,9 @@ não uma que eu tenha visto funcionar numa role: pode faltar uma ação que só 
 
 ## Custo
 
-**Zero até aqui.** Nada é executado contra uma conta AWS: o projeto roda e testa só no computador.
+**Zero.** Nada é executado contra uma conta AWS: o projeto roda e testa só no computador (Docker e DynamoDB Local). O Terraform
+em `infra/` criaria recursos que cobram (Fargate por execução, DynamoDB por requisição, SSM, logs) **se alguém o aplicasse**; ninguém
+o aplicou, e o custo dele não foi calculado (veja a Etapa 6).
 
 ## Roteiro
 
@@ -245,7 +312,7 @@ não uma que eu tenha visto funcionar numa role: pode faltar uma ação que só 
 - [x] Etapa 3: DynamoDB e comparação entre execuções (escritas condicionais, três experimentos medidos no DynamoDB Local)
 - [x] Etapa 4: paralelismo e métricas (12 regiões: 3,7 s em sequência, 0,31 s em paralelo contra um servidor com latência fixa)
 - [x] Etapa 5: API e alertas (consulta paginada pelo índice, ignorar com validade, chave em tempo constante, Telegram com WireMock; aviso real **não executado**)
-- [ ] Etapa 6: container, agendamento e deploy
+- [x] Etapa 6: container, agendamento e deploy (imagem não-root, modo job, CI e Terraform escritos e validados offline; **nada aplicado na AWS**)
 
 ## Licença
 
