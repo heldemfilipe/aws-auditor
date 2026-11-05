@@ -1,0 +1,9 @@
+.git
+.github
+target
+docs
+infra
+*.md
+local
+reports
+.env
