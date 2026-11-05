@@ -23,3 +23,18 @@ jobs:
 
       - name: Build e testes
         run: ./mvnw -B -ntp verify
+
+  # A imagem tem que construir e passar no Trivy a cada mudança (sem publicar nada: publicar é o publicar.yml, em tag)
+  imagem:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build da imagem
+        run: docker build -t aws-auditor:ci .
+      - uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: aws-auditor:ci
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
