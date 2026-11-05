@@ -37,3 +37,11 @@ build/
 *.pem
 reports/
 local/
+
+### Terraform ###
+infra/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log

@@ -1,0 +1,5 @@
+# Copie para terraform.tfvars (que o .gitignore não deixa entrar no repositório) e preencha com os SEUS valores.
+# Os valores abaixo são fictícios.
+imagem     = "ghcr.io/DONO/aws-auditor:1.0.0"
+vpc_id     = "vpc-0123456789abcdef0"
+subnet_ids = ["subnet-0123456789abcdef0"]
